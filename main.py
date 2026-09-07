@@ -113,7 +113,7 @@ async def despachar_alerta_para_usuario(timer):
     maps_url = f"https://maps.google.com/?q={lat},{lon}" if lat and lon else "Ubicación no disponible"
 
     sos_msg = (
-        f"🚨 ALERTA TEMPRANA DE EMERGENCIA / HOMBRE MUERTO 🚨\n\n"
+        f"🚨 ALERTA TEMPRANA DE EMERGENCIA -> CONTACTA A LA PERSONA SINO CONTESTA LLAMA AL 911 🚨\n\n"
         f"De: {first_name} ({phone})\n"
         f"Motivo: ⏱️ CRONÓMETRO DE SEGURIDAD VENCIDO SIN RESPUESTA\n\n"
         f"📍 Mi última ubicación GPS exacta:\n{maps_url}\n\n"
@@ -137,28 +137,44 @@ async def despachar_alerta_para_usuario(timer):
         "status": "dispatched"
     })
 
+def revisar_y_despachar_cronometros_vencidos():
+    """Consulta Supabase buscando cronómetros vencidos y despacha alertas por Telegram"""
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        print("[Poller] SUPABASE_SERVICE_ROLE_KEY no configurada.")
+        return {"error": "SUPABASE_SERVICE_ROLE_KEY no configurada", "procesados": 0}
+
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    endpoint = f"active_timers?status=eq.running&alert_triggered=eq.false&expires_at=lte.{now_iso}&select=*"
+    expired = supabase_request(endpoint) or []
+    procesados = []
+
+    for timer in expired:
+        timer_id = timer.get("id")
+        user_id = timer.get("user_id")
+        print(f"⏱️ Cronómetro vencido detectado: {timer_id} para usuario {user_id}")
+        # Marcar inmediatamente como vencido para no repetir llamadas
+        supabase_request(f"active_timers?id=eq.{timer_id}", method="PATCH", payload={
+            "status": "expired",
+            "alert_triggered": True,
+            "alert_triggered_at": now_iso
+        })
+        # Despachar llamadas y mensajes SOS
+        asyncio.run(despachar_alerta_para_usuario(timer))
+        procesados.append(timer_id)
+
+    return {
+        "success": True,
+        "cronometros_vencidos": len(procesados),
+        "timers_procesados": procesados,
+        "timestamp": now_iso
+    }
+
 def loop_revision_10_segundos():
-    """Hilo en segundo plano: revisa cada 10 segundos cronómetros vencidos en Supabase"""
+    """Hilo en segundo plano: revisa continuamente cada 10 segundos cronómetros vencidos"""
     print("[Sentinel Poller] Iniciado: comprobación continua cada 10 segundos.")
     while True:
         try:
-            if SUPABASE_SERVICE_ROLE_KEY:
-                now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                # Consultar cronómetros running vencidos
-                endpoint = f"active_timers?status=eq.running&alert_triggered=eq.false&expires_at=lte.{now_iso}&select=*"
-                expired = supabase_request(endpoint) or []
-
-                for timer in expired:
-                    timer_id = timer.get("id")
-                    print(f"⏱️ [Poller 10s] Cronómetro vencido detectado: {timer_id} para usuario {timer.get('user_id')}")
-                    # Marcar inmediatamente como vencido para no repetir
-                    supabase_request(f"active_timers?id=eq.{timer_id}", method="PATCH", payload={
-                        "status": "expired",
-                        "alert_triggered": True,
-                        "alert_triggered_at": now_iso
-                    })
-                    # Despachar llamadas y mensajes
-                    asyncio.run(despachar_alerta_para_usuario(timer))
+            revisar_y_despachar_cronometros_vencidos()
         except Exception as e:
             print(f"[Poller Error]: {e}")
 
@@ -178,39 +194,69 @@ class RenderWebServer(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        # Endpoint de salud y Keep-Alive para Render
-        if self.path == "/health" or self.path == "/":
+        clean_path = self.path.split("?")[0].rstrip("/")
+        # Endpoint de salud y Keep-Alive
+        if clean_path in ["", "/health"]:
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_cors_headers()
             self.end_headers()
-            resp = {"status": "online", "service": "Sentinel Telethon Bridge", "time": datetime.datetime.utcnow().isoformat()}
+            resp = {
+                "status": "online",
+                "service": "Sentinel Telethon Bridge",
+                "time": datetime.datetime.now(datetime.timezone.utc).isoformat()
+            }
             self.wfile.write(json.dumps(resp).encode("utf-8"))
+        # Endpoint directo activable por navegador o Cron externo (ej: cron-job.org)
+        elif clean_path in ["/dispatch-immediate", "/cron", "/check-timers"]:
+            try:
+                res = revisar_y_despachar_cronometros_vencidos()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps(res).encode("utf-8"))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
         else:
             self.send_response(404)
             self.send_cors_headers()
             self.end_headers()
 
     def do_POST(self):
-        # Endpoint directo si la app solicita despacho inmediato (ej: PIN de Coacción)
-        if self.path == "/dispatch-immediate":
+        clean_path = self.path.split("?")[0].rstrip("/")
+        if clean_path == "/dispatch-immediate":
             length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length).decode("utf-8")
-            try:
-                data = json.loads(body)
-                user_id = data.get("user_id")
-                reason = data.get("reason", "manual")
-                lat = data.get("latitude")
-                lon = data.get("longitude")
+            body = self.rfile.read(length).decode("utf-8") if length > 0 else ""
+            data = {}
+            if body:
+                try:
+                    data = json.loads(body)
+                except Exception:
+                    data = {}
 
-                timer_fake = {"user_id": user_id, "last_latitude": lat, "last_longitude": lon}
-                asyncio.run(despachar_alerta_para_usuario(timer_fake))
+            user_id = data.get("user_id")
+            try:
+                if user_id:
+                    # Despacho forzado bajo demanda (ej: PIN de coacción desde la aplicación web)
+                    lat = data.get("latitude")
+                    lon = data.get("longitude")
+                    timer_fake = {"user_id": user_id, "last_latitude": lat, "last_longitude": lon}
+                    asyncio.run(despachar_alerta_para_usuario(timer_fake))
+                    res = {"success": True, "mode": "immediate_user_alert", "user_id": user_id}
+                else:
+                    # Llamada desde Cron externo vía POST sin user_id específico: revisar base de datos
+                    res = revisar_y_despachar_cronometros_vencidos()
 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_cors_headers()
                 self.end_headers()
-                self.wfile.write(json.dumps({"success": True}).encode("utf-8"))
+                self.wfile.write(json.dumps(res).encode("utf-8"))
             except Exception as e:
                 self.send_response(500)
                 self.send_header("Content-Type", "application/json")
