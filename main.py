@@ -143,7 +143,7 @@ def revisar_y_despachar_cronometros_vencidos():
         print("[Poller] SUPABASE_SERVICE_ROLE_KEY no configurada.")
         return {"error": "SUPABASE_SERVICE_ROLE_KEY no configurada", "procesados": 0}
 
-    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    now_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     endpoint = f"active_timers?status=eq.running&alert_triggered=eq.false&expires_at=lte.{now_iso}&select=*"
     expired = supabase_request(endpoint) or []
     procesados = []
