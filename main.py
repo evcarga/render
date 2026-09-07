@@ -165,17 +165,30 @@ def loop_revision_10_segundos():
         asyncio.run(asyncio.sleep(10))
 
 class RenderWebServer(http.server.BaseHTTPRequestHandler):
-    """Servidor HTTP para recibir Keep-Alive y llamadas bajo demanda"""
+    """Servidor HTTP para recibir Keep-Alive y llamadas bajo demanda con soporte CORS"""
+    def send_cors_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, x-client-info, apikey")
+
+    def do_OPTIONS(self):
+        # Manejo de la solicitud Preflight CORS del navegador
+        self.send_response(200)
+        self.send_cors_headers()
+        self.end_headers()
+
     def do_GET(self):
         # Endpoint de salud y Keep-Alive para Render
         if self.path == "/health" or self.path == "/":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_cors_headers()
             self.end_headers()
             resp = {"status": "online", "service": "Sentinel Telethon Bridge", "time": datetime.datetime.utcnow().isoformat()}
             self.wfile.write(json.dumps(resp).encode("utf-8"))
         else:
             self.send_response(404)
+            self.send_cors_headers()
             self.end_headers()
 
     def do_POST(self):
@@ -195,15 +208,18 @@ class RenderWebServer(http.server.BaseHTTPRequestHandler):
 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
+                self.send_cors_headers()
                 self.end_headers()
                 self.wfile.write(json.dumps({"success": True}).encode("utf-8"))
             except Exception as e:
                 self.send_response(500)
                 self.send_header("Content-Type", "application/json")
+                self.send_cors_headers()
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
         else:
             self.send_response(404)
+            self.send_cors_headers()
             self.end_headers()
 
 if __name__ == "__main__":
