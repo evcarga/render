@@ -1,20 +1,19 @@
 """Sentinel - puente Telethon en Render.
 
 Cambios respecto a la version anterior:
-  1. El mensaje SOS incluye el RASTRO de ubicaciones (tabla location_history),
-     no solo el ultimo punto.
-  2. El PIN de coaccion ya no manda el mismo texto que un vencimiento normal.
-     Antes, un aviso por coaccion le decia a los contactos "contacta a la
-     persona", que es justo lo que NO deben hacer si alguien la esta reteniendo
-     y mirando su telefono.
-  3. El POST /dispatch-immediate responde al instante y despacha en segundo
-     plano. Antes bloqueaba el servidor 12 segundos por cada contacto.
+  1. El rastro del mensaje SOLO trae los puntos de la guardia en curso (desde
+     que se activo el cronometro), no ubicaciones de dias anteriores.
+  2. Cada alerta lleva un enlace de seguimiento en vivo (pagina en GitHub
+     Pages). El token del enlace solo existe en el mensaje: en la base se
+     guarda su SHA-256. El enlace muere a los 3 dias de activar el cronometro.
+  3. Cada hora se purgan los puntos de mas de 3 dias y las sesiones vencidas.
 """
 
 import os
 import json
 import random
 import hashlib
+import secrets
 import asyncio
 import datetime
 import time
@@ -32,9 +31,21 @@ PORT = int(os.environ.get("PORT", 5000))
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://oxzhmeeyiesflhhhehpa.supabase.co")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
-# Cuantos puntos del rastro se incluyen en el mensaje. La app guarda uno cada
-# 10 minutos, asi que 12 son las ultimas 2 horas.
-RASTRO_PUNTOS = int(os.environ.get("RASTRO_PUNTOS", "12"))
+# Cuantos puntos del rastro se escriben en el mensaje. El recorrido completo
+# esta en el enlace de seguimiento; aqui van solo los mas recientes.
+RASTRO_PUNTOS = int(os.environ.get("RASTRO_PUNTOS", "6"))
+
+# Pagina de seguimiento (GitHub Pages). El token va en el fragmento (#t=...),
+# que el navegador nunca envia a ningun servidor ni en el Referer.
+TRACKING_BASE_URL = os.environ.get(
+    "TRACKING_BASE_URL", "https://evcarga.github.io/seguimiento/")
+
+# Zona horaria de las horas del mensaje (los contactos leen hora local).
+ZONA_HORARIA = os.environ.get("ZONA_HORARIA", "America/Bogota")
+
+# Una sesion cerrada hace menos que esto todavia se considera "la de esta
+# alerta" (carrera entre el PIN de coaccion y el cierre de la guardia).
+MARGEN_SESION = datetime.timedelta(minutes=10)
 
 # Una sola sesion de Telethon por usuario a la vez: dos despachos simultaneos
 # con la misma string session se pisan y Telegram cierra la conexion.
@@ -58,7 +69,7 @@ def supabase_request(endpoint, method="GET", payload=None):
         "Content-Type": "application/json",
         "Prefer": "return=representation"
     }
-    data_bytes = json.dumps(payload).encode("utf-8") if payload else None
+    data_bytes = json.dumps(payload).encode("utf-8") if payload is not None else None
     req = Request(url, data=data_bytes, headers=headers, method=method)
     try:
         with urlopen(req, timeout=10) as resp:
@@ -69,14 +80,109 @@ def supabase_request(endpoint, method="GET", payload=None):
         return None
 
 
+def ahora_utc():
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def iso(t):
+    return t.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def parse_iso(texto):
+    if not texto:
+        return None
+    try:
+        t = datetime.datetime.fromisoformat(str(texto).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    return t if t.tzinfo else t.replace(tzinfo=datetime.timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Sesion de guardia y enlace de seguimiento
+# ---------------------------------------------------------------------------
+
+def inicio_cronometro(user_id, timer):
+    """Cuando se activo el cronometro de esta alerta (None si no se sabe)."""
+    inicio = parse_iso(timer.get("started_at"))
+    if inicio is None:
+        cron = supabase_request(
+            f"active_timers?user_id=eq.{user_id}&select=started_at&limit=1")
+        if isinstance(cron, list) and cron:
+            inicio = parse_iso(cron[0].get("started_at"))
+    return inicio
+
+
+def obtener_sesion(user_id, timer):
+    """La sesion de la guardia que disparo esta alerta.
+
+    La crea la app al activar el cronometro. Si no existe (app vieja o sin red
+    en ese momento) se crea aqui, empezando en el started_at del cronometro,
+    para que el rastro igual quede limitado a esta guardia.
+    """
+    inicio = inicio_cronometro(user_id, timer)
+
+    filas = supabase_request(
+        f"guard_sessions?user_id=eq.{user_id}"
+        "&select=id,started_at,stopped_at,expires_at"
+        "&order=started_at.desc&limit=1"
+    )
+    if isinstance(filas, list) and filas:
+        s = filas[0]
+        empieza = parse_iso(s.get("started_at"))
+        parada = parse_iso(s.get("stopped_at"))
+        vence = parse_iso(s.get("expires_at"))
+        vigente = vence is None or vence > ahora_utc()
+        abierta = parada is None or parada > ahora_utc() - MARGEN_SESION
+        # Una sesion que empezo bastante antes que este cronometro es de otra
+        # guardia (una app vieja nunca las cierra): no se reutiliza.
+        misma_guardia = (inicio is None or empieza is None or
+                         empieza >= inicio - MARGEN_SESION)
+        if vigente and abierta and misma_guardia:
+            return s
+
+    if inicio is None or inicio < ahora_utc() - datetime.timedelta(days=3):
+        inicio = ahora_utc()
+
+    creada = supabase_request("guard_sessions", method="POST", payload={
+        "user_id": user_id,
+        "started_at": iso(inicio),
+        "expires_at": iso(inicio + datetime.timedelta(days=3)),
+    })
+    if isinstance(creada, list) and creada:
+        return creada[0]
+    return None
+
+
+def crear_enlace(sesion):
+    """Genera un token nuevo para esta alerta y devuelve la URL, o None."""
+    if not sesion or not sesion.get("id"):
+        return None
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    ok = supabase_request("tracking_links", method="POST", payload={
+        "token_hash": token_hash,
+        "session_id": sesion["id"],
+    })
+    if ok is None:
+        return None
+    return f"{TRACKING_BASE_URL}#t={token}"
+
+
 # ---------------------------------------------------------------------------
 # Rastro de ubicaciones
 # ---------------------------------------------------------------------------
 
-def obtener_rastro(user_id, limite=RASTRO_PUNTOS):
-    """Ultimos puntos guardados por la app, del mas reciente al mas antiguo."""
+def obtener_rastro(user_id, desde, limite=RASTRO_PUNTOS):
+    """Puntos de esta guardia (desde que se activo el cronometro), del mas
+    reciente al mas antiguo. Nunca devuelve puntos de guardias anteriores."""
+    if desde is None:
+        return []
+    # Mismo margen de 1 minuto que usa get_tracking en la base.
+    desde_iso = iso(desde - datetime.timedelta(minutes=1))
     endpoint = (
         f"location_history?user_id=eq.{user_id}"
+        f"&recorded_at=gte.{desde_iso}"
         "&select=latitude,longitude,accuracy,recorded_at"
         "&order=recorded_at.desc"
         f"&limit={limite}"
@@ -93,12 +199,22 @@ def url_mapa(lat, lon):
     return f"https://maps.google.com/?q={lat},{lon}"
 
 
-def hora_legible(iso_texto):
+def zona_local():
     try:
-        t = datetime.datetime.fromisoformat(str(iso_texto).replace("Z", "+00:00"))
-        return t.strftime("%d/%m %H:%M UTC")
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(ZONA_HORARIA)
     except Exception:
+        return None
+
+
+def hora_legible(iso_texto):
+    t = parse_iso(iso_texto)
+    if t is None:
         return str(iso_texto or "?")
+    zona = zona_local()
+    if zona is None:
+        return t.strftime("%d/%m %H:%M UTC")
+    return t.astimezone(zona).strftime("%d/%m %I:%M %p")
 
 
 def formatear_rastro(puntos):
@@ -117,7 +233,7 @@ def formatear_rastro(puntos):
 # Mensaje SOS
 # ---------------------------------------------------------------------------
 
-def construir_mensaje(first_name, phone, lat, lon, puntos, reason):
+def construir_mensaje(first_name, phone, lat, lon, puntos, reason, enlace=None):
     coaccion = (reason == "duress_pin_coaccion")
 
     # Si el disparo no trajo coordenadas, se usa el punto mas reciente del
@@ -146,10 +262,19 @@ def construir_mensaje(first_name, phone, lat, lon, puntos, reason):
             "Contacta a la persona. Si no contesta, llama al 911."
         )
 
+    seguimiento = ""
+    if enlace:
+        seguimiento = (
+            "SEGUIMIENTO EN VIVO (mapa con el recorrido, se actualiza solo):\n"
+            f"{enlace}\n"
+            "El enlace deja de funcionar a los 3 dias. No lo compartas.\n\n"
+        )
+
     return (
         f"{encabezado}\n\n"
+        f"{seguimiento}"
         f"Ultima ubicacion conocida:\n{ubicacion}\n\n"
-        f"Recorrido de las ultimas horas (lo mas reciente primero):\n"
+        f"Recorrido desde que activo la guardia (lo mas reciente primero):\n"
         f"{formatear_rastro(puntos)}"
     )
 
@@ -236,9 +361,15 @@ async def despachar_alerta_para_usuario(timer, reason="timer_expired"):
 
     lat = timer.get("last_latitude")
     lon = timer.get("last_longitude")
-    puntos = obtener_rastro(user_id)
 
-    sos_msg = construir_mensaje(first_name, phone, lat, lon, puntos, reason)
+    sesion = obtener_sesion(user_id, timer)
+    desde = parse_iso(sesion.get("started_at")) if sesion else \
+        parse_iso(timer.get("started_at"))
+    puntos = obtener_rastro(user_id, desde)
+    enlace = crear_enlace(sesion)
+
+    sos_msg = construir_mensaje(first_name, phone, lat, lon, puntos, reason,
+                                enlace)
 
     logs = []
     for c in contacts:
@@ -302,14 +433,29 @@ def revisar_y_despachar_cronometros_vencidos():
     }
 
 
+def purgar_datos_vencidos():
+    """Borra puntos de mas de 3 dias y sesiones (y enlaces) vencidas. Es un
+    respaldo del pg_cron horario de la base."""
+    if SUPABASE_SERVICE_ROLE_KEY:
+        supabase_request("rpc/purge_old_location_history", method="POST",
+                         payload={})
+
+
 def loop_revision_10_segundos():
     """Hilo en segundo plano: revisa cronometros vencidos cada 10 segundos"""
     print("[Sentinel Poller] Iniciado: comprobacion continua cada 10 segundos.")
+    ultima_purga = 0.0
     while True:
         try:
             revisar_y_despachar_cronometros_vencidos()
         except Exception as e:
             print(f"[Poller Error]: {e}")
+        if time.time() - ultima_purga > 3600:
+            ultima_purga = time.time()
+            try:
+                purgar_datos_vencidos()
+            except Exception as e:
+                print(f"[Purga Error]: {e}")
         time.sleep(10)
 
 
@@ -381,6 +527,7 @@ class RenderWebServer(http.server.BaseHTTPRequestHandler):
                     "user_id": user_id,
                     "last_latitude": data.get("latitude"),
                     "last_longitude": data.get("longitude"),
+                    "started_at": data.get("started_at"),
                 }
                 # Se responde YA y se despacha en segundo plano: cada contacto
                 # tarda 12 s en timbrar, y la app no puede quedarse esperando
