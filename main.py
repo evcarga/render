@@ -10,6 +10,7 @@ Cambios respecto a la version anterior:
 """
 
 import os
+import re
 import json
 import random
 import hashlib
@@ -88,11 +89,19 @@ def iso(t):
     return t.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
+_FRACCION = re.compile(r"\.(\d+)")
+
+
 def parse_iso(texto):
     if not texto:
         return None
+    txt = str(texto).strip().replace("Z", "+00:00").replace(" ", "T", 1)
+    # Postgres recorta los ceros finales de los microsegundos (".27776") y el
+    # fromisoformat de Python 3.10 solo acepta 3 o 6 cifras: se completan a 6.
+    txt = _FRACCION.sub(lambda m: "." + (m.group(1) + "000000")[:6], txt, 1)
+    txt = re.sub(r"([+-]\d{2})$", r"\g<1>:00", txt)  # "+00" -> "+00:00"
     try:
-        t = datetime.datetime.fromisoformat(str(texto).replace("Z", "+00:00"))
+        t = datetime.datetime.fromisoformat(txt)
     except Exception:
         return None
     return t if t.tzinfo else t.replace(tzinfo=datetime.timezone.utc)
@@ -199,22 +208,36 @@ def url_mapa(lat, lon):
     return f"https://maps.google.com/?q={lat},{lon}"
 
 
+# Colombia no tiene horario de verano: si el servidor no trae la base de zonas
+# horarias, UTC-5 fijo da exactamente la misma hora.
+_COLOMBIA_FIJA = datetime.timezone(datetime.timedelta(hours=-5), "COT")
+
+
 def zona_local():
     try:
         from zoneinfo import ZoneInfo
         return ZoneInfo(ZONA_HORARIA)
     except Exception:
-        return None
+        return _COLOMBIA_FIJA
+
+
+def fecha_colombia(t, con_anio=False):
+    """'24/09 10:15 a. m.' en hora de Colombia (sin depender del idioma del
+    servidor para el a. m. / p. m.)."""
+    if t is None:
+        return "?"
+    local = t.astimezone(zona_local())
+    fecha = local.strftime("%d/%m/%Y" if con_anio else "%d/%m")
+    hora12 = local.hour % 12 or 12
+    sufijo = "a. m." if local.hour < 12 else "p. m."
+    return f"{fecha} {hora12:02d}:{local.minute:02d} {sufijo}"
 
 
 def hora_legible(iso_texto):
     t = parse_iso(iso_texto)
     if t is None:
         return str(iso_texto or "?")
-    zona = zona_local()
-    if zona is None:
-        return t.strftime("%d/%m %H:%M UTC")
-    return t.astimezone(zona).strftime("%d/%m %I:%M %p")
+    return fecha_colombia(t)
 
 
 def formatear_rastro(puntos):
@@ -233,7 +256,8 @@ def formatear_rastro(puntos):
 # Mensaje SOS
 # ---------------------------------------------------------------------------
 
-def construir_mensaje(first_name, phone, lat, lon, puntos, reason, enlace=None):
+def construir_mensaje(first_name, phone, lat, lon, puntos, reason, enlace=None,
+                      inicio_guardia=None):
     coaccion = (reason == "duress_pin_coaccion")
 
     # Si el disparo no trajo coordenadas, se usa el punto mas reciente del
@@ -245,11 +269,18 @@ def construir_mensaje(first_name, phone, lat, lon, puntos, reason, enlace=None):
     ubicacion = url_mapa(lat, lon) if lat is not None and lon is not None \
         else "Ubicacion no disponible"
 
+    # Todas las horas del mensaje van en hora de Colombia.
+    horas = f"Hora de la alerta: {fecha_colombia(ahora_utc(), True)} (hora Colombia)"
+    if inicio_guardia is not None:
+        horas += (f"\nGuardia activada: {fecha_colombia(inicio_guardia, True)}"
+                  " (hora Colombia)")
+
     if coaccion:
         encabezado = (
             "ALERTA DE COACCION - ESTA PERSONA ESTA SIENDO OBLIGADA\n\n"
             f"De: {first_name} ({phone})\n"
-            "Motivo: activo su PIN de emergencia bajo amenaza.\n\n"
+            "Motivo: activo su PIN de emergencia bajo amenaza.\n"
+            f"{horas}\n\n"
             "NO la llames ni le escribas: quien la retiene podria estar\n"
             "mirando su telefono y eso la pondria en mas peligro.\n"
             "Llama al 911 y entrega la ubicacion de abajo."
@@ -258,23 +289,32 @@ def construir_mensaje(first_name, phone, lat, lon, puntos, reason, enlace=None):
         encabezado = (
             "ALERTA TEMPRANA DE EMERGENCIA\n\n"
             f"De: {first_name} ({phone})\n"
-            "Motivo: cronometro de seguridad vencido sin respuesta.\n\n"
+            "Motivo: cronometro de seguridad vencido sin respuesta.\n"
+            f"{horas}\n\n"
             "Contacta a la persona. Si no contesta, llama al 911."
         )
+
+    vence_enlace = "El enlace deja de funcionar a los 3 dias. "
+    if inicio_guardia is not None:
+        vence_enlace = (
+            "El enlace deja de funcionar el "
+            f"{fecha_colombia(inicio_guardia + datetime.timedelta(days=3), True)}"
+            " (hora Colombia). ")
 
     seguimiento = ""
     if enlace:
         seguimiento = (
             "SEGUIMIENTO EN VIVO (mapa con el recorrido, se actualiza solo):\n"
             f"{enlace}\n"
-            "El enlace deja de funcionar a los 3 dias. No lo compartas.\n\n"
+            f"{vence_enlace}No lo compartas.\n\n"
         )
 
     return (
         f"{encabezado}\n\n"
         f"{seguimiento}"
         f"Ultima ubicacion conocida:\n{ubicacion}\n\n"
-        f"Recorrido desde que activo la guardia (lo mas reciente primero):\n"
+        f"Recorrido desde que activo la guardia (hora Colombia, lo mas "
+        f"reciente primero):\n"
         f"{formatear_rastro(puntos)}"
     )
 
@@ -369,7 +409,7 @@ async def despachar_alerta_para_usuario(timer, reason="timer_expired"):
     enlace = crear_enlace(sesion)
 
     sos_msg = construir_mensaje(first_name, phone, lat, lon, puntos, reason,
-                                enlace)
+                                enlace, inicio_guardia=desde)
 
     logs = []
     for c in contacts:
