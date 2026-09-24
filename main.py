@@ -34,7 +34,7 @@ from telethon.tl.types import (
 )
 
 # Se muestra en /health para saber que version esta desplegada en Render.
-VERSION = "2026-09-24.3-llamada"
+VERSION = "2026-09-24.4-llamada"
 
 # Variables de entorno en Render
 PORT = int(os.environ.get("PORT", 5000))
@@ -448,6 +448,11 @@ async def timbrar(client, peer, resultados):
     llamada (Telegram lo confirma con receive_date)."""
     estado = {"id": None, "recibida": False, "contestada": False, "fin": None}
     terminado = asyncio.Event()
+    t0 = time.monotonic()
+    eventos = []  # (segundos desde la solicitud, que paso)
+
+    def anotar(que):
+        eventos.append(f"{time.monotonic() - t0:.1f}s {que}")
 
     async def al_actualizar(update):
         if not isinstance(update, UpdatePhoneCall):
@@ -455,6 +460,12 @@ async def timbrar(client, peer, resultados):
         pc = update.phone_call
         if estado["id"] is not None and getattr(pc, "id", None) != estado["id"]:
             return
+        detalle = type(pc).__name__
+        if isinstance(pc, PhoneCallWaiting):
+            detalle += " recibida" if pc.receive_date else " sin_recibir"
+        if isinstance(pc, PhoneCallDiscarded) and pc.reason:
+            detalle += ":" + type(pc.reason).__name__
+        anotar(detalle)
         if isinstance(pc, PhoneCallWaiting) and pc.receive_date:
             estado["recibida"] = True
         elif isinstance(pc, PhoneCallAccepted):
@@ -477,6 +488,7 @@ async def timbrar(client, peer, resultados):
         ))
         llamada = res.phone_call
         estado["id"] = llamada.id
+        anotar("solicitada " + type(llamada).__name__)
         if isinstance(llamada, PhoneCallWaiting) and llamada.receive_date:
             estado["recibida"] = True
         resultados["llamada"] = "solicitada"
@@ -511,6 +523,8 @@ async def timbrar(client, peer, resultados):
         resultados["llamada"] = "sin_confirmacion_de_timbre"
     if estado["fin"]:
         resultados["llamada_fin"] = estado["fin"]
+    resultados["llamada_recibida_por_el_telefono"] = estado["recibida"]
+    resultados["llamada_eventos"] = eventos
 
 
 async def verificar_historial(client, peer, resultados):
