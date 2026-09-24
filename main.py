@@ -22,10 +22,19 @@ import http.server
 import threading
 from urllib.request import Request, urlopen
 
-from telethon.sync import TelegramClient
+from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 from telethon.tl.functions.phone import RequestCallRequest, DiscardCallRequest
-from telethon.tl.types import PhoneCallProtocol, PhoneCallDiscardReasonDisconnect
+from telethon.tl.functions.contacts import GetContactsRequest, ImportContactsRequest
+from telethon.tl.functions.updates import GetStateRequest
+from telethon.tl.types import (
+    PhoneCallProtocol, PhoneCallDiscardReasonDisconnect, InputPeerUser,
+    InputPhoneCall, InputPhoneContact, UpdatePhoneCall, PhoneCallWaiting,
+    PhoneCallAccepted, PhoneCallDiscarded, MessageActionPhoneCall,
+)
+
+# Se muestra en /health para saber que version esta desplegada en Render.
+VERSION = "2026-09-24.3-llamada"
 
 # Variables de entorno en Render
 PORT = int(os.environ.get("PORT", 5000))
@@ -259,6 +268,7 @@ def formatear_rastro(puntos):
 def construir_mensaje(first_name, phone, lat, lon, puntos, reason, enlace=None,
                       inicio_guardia=None):
     coaccion = (reason == "duress_pin_coaccion")
+    prueba = (reason == "prueba")
 
     # Si el disparo no trajo coordenadas, se usa el punto mas reciente del
     # rastro en vez de mandar "Ubicacion no disponible".
@@ -275,7 +285,15 @@ def construir_mensaje(first_name, phone, lat, lon, puntos, reason, enlace=None,
         horas += (f"\nGuardia activada: {fecha_colombia(inicio_guardia, True)}"
                   " (hora Colombia)")
 
-    if coaccion:
+    if prueba:
+        encabezado = (
+            "PRUEBA DEL SISTEMA SENTINEL - NO ES UNA EMERGENCIA\n\n"
+            f"De: {first_name} ({phone})\n"
+            "Esto es solo una prueba del mensaje, la llamada y el enlace de\n"
+            "seguimiento. No tienes que hacer nada.\n"
+            f"{horas}"
+        )
+    elif coaccion:
         encabezado = (
             "ALERTA DE COACCION - ESTA PERSONA ESTA SIENDO OBLIGADA\n\n"
             f"De: {first_name} ({phone})\n"
@@ -323,59 +341,251 @@ def construir_mensaje(first_name, phone, lat, lon, puntos, reason, enlace=None,
 # Telethon
 # ---------------------------------------------------------------------------
 
-async def ejecutar_llamada_y_mensaje(api_id, api_hash, session_string,
-                                     numero_destino, mensaje_texto):
-    """Llama y envia mensaje directo mediante Telethon MTProto"""
-    client = TelegramClient(StringSession(session_string), int(api_id), str(api_hash))
-    await client.connect()
-    resultados = {}
+# Versiones del protocolo de llamadas que usan las apps actuales de Telegram.
+# Con la version vieja ('1.0.0', capa 92 fija) el servidor aceptaba la llamada
+# pero el telefono del contacto podia no llegar a timbrar.
+PROTOCOLO_LLAMADA = PhoneCallProtocol(
+    udp_p2p=True, udp_reflector=True,
+    min_layer=65, max_layer=92,
+    library_versions=["2.4.4", "2.7.7", "5.0.0", "6.0.0", "7.0.0",
+                      "8.0.0", "9.0.0", "10.0.0", "11.0.0"],
+)
+
+# Cuanto timbra como maximo (Telegram corta solo a los ~45 s).
+SEGUNDOS_TIMBRE = int(os.environ.get("SEGUNDOS_TIMBRE", "30"))
+
+# Esperas por limite de Telegram (FloodWait) que se aguantan en vez de fallar.
+ESPERA_MAXIMA_FLOOD = 30
+
+
+def solo_digitos(numero):
+    return re.sub(r"\D", "", str(numero or ""))
+
+
+def guardar_cache_contacto(contacto, usuario):
+    """Guarda id y access_hash de Telegram del contacto: los proximos despachos
+    ya no tienen que buscarlo (esa busqueda es la que Telegram limita)."""
+    cid = contacto.get("id")
+    if not cid:
+        return
+    supabase_request(f"emergency_contacts?id=eq.{cid}", method="PATCH", payload={
+        "telegram_user_id": f"{usuario.id}:{usuario.access_hash}"})
+
+
+def borrar_cache_contacto(contacto):
+    cid = contacto.get("id")
+    if cid:
+        supabase_request(f"emergency_contacts?id=eq.{cid}", method="PATCH",
+                         payload={"telegram_user_id": None})
+
+
+async def llamar_con_espera(client, peticion):
+    """Ejecuta la peticion; si Telegram pide esperar poco, espera y reintenta."""
     try:
-        entity = await client.get_input_entity(numero_destino)
+        return await client(peticion)
+    except errors.FloodWaitError as e:
+        if e.seconds > ESPERA_MAXIMA_FLOOD:
+            raise
+        print(f"[Telethon] FloodWait {e.seconds}s, esperando...")
+        await asyncio.sleep(e.seconds + 1)
+        return await client(peticion)
 
-        # 1. Enviar mensaje de auxilio con ubicacion y rastro
-        if mensaje_texto:
-            await client.send_message(entity, mensaje_texto)
-            resultados['mensaje'] = 'enviado'
-            print(f"[Telethon] Mensaje SOS entregado a {numero_destino}")
 
-        # 2. Iniciar timbrado VoIP
-        g_a = bytes([random.randint(0, 255) for _ in range(256)])
-        g_a_hash = hashlib.sha256(g_a).digest()
+class Resolutor:
+    """Encuentra al contacto en Telegram gastando lo menos posible.
 
-        call_result = await client(RequestCallRequest(
-            user_id=entity,
-            random_id=random.randint(0, 0x7fffffff),
-            g_a_hash=g_a_hash,
-            protocol=PhoneCallProtocol(
-                udp_p2p=True, udp_reflector=True,
-                min_layer=92, max_layer=92,
-                library_versions=['1.0.0']
-            ),
-            video=False
-        ))
-        resultados['llamada'] = 'timbrando'
-        print(f"[Telethon] Timbrando VoIP a {numero_destino}...")
+    1. id guardado en emergency_contacts.telegram_user_id (sin pedir nada).
+    2. Lista de contactos de la cuenta, UNA vez por despacho.
+    3. Importar el numero como contacto (si no estaba en la lista).
+    """
 
-        # Timbrar durante 12 segundos para alertar
-        await asyncio.sleep(12)
+    def __init__(self, client):
+        self.client = client
+        self._por_telefono = None
+
+    async def _lista(self):
+        if self._por_telefono is None:
+            self._por_telefono = {}
+            res = await llamar_con_espera(self.client, GetContactsRequest(hash=0))
+            for u in getattr(res, "users", []):
+                if getattr(u, "phone", None):
+                    self._por_telefono[solo_digitos(u.phone)] = u
+        return self._por_telefono
+
+    async def resolver(self, contacto, ignorar_cache=False):
+        cache = (contacto.get("telegram_user_id") or "").strip()
+        if not ignorar_cache and re.fullmatch(r"\d+:-?\d+", cache):
+            uid, ah = cache.split(":")
+            return InputPeerUser(int(uid), int(ah)), "cache"
+
+        numero = solo_digitos(contacto.get("phone_number"))
+        usuario = None
         try:
-            await client(DiscardCallRequest(
-                peer=call_result.phone_call,
-                duration=0,
-                reason=PhoneCallDiscardReasonDisconnect(),
-                connection_id=0
-            ))
-            print(f"[Telethon] Timbrado finalizado a {numero_destino}")
+            usuario = (await self._lista()).get(numero)
+        except errors.FloodWaitError as e:
+            print(f"[Telethon] Lista de contactos limitada ({e.seconds}s); "
+                  "se intenta importar el numero.")
+
+        origen = "lista_contactos"
+        if usuario is None:
+            res = await llamar_con_espera(self.client, ImportContactsRequest([
+                InputPhoneContact(client_id=random.randint(1, 2**31),
+                                  phone="+" + numero,
+                                  first_name=contacto.get("name") or "Contacto",
+                                  last_name="")]))
+            usuario = res.users[0] if res.users else None
+            origen = "importado"
+
+        if usuario is None:
+            raise ValueError(f"El numero {numero} no tiene Telegram o no se "
+                             "pudo encontrar.")
+        guardar_cache_contacto(contacto, usuario)
+        return InputPeerUser(usuario.id, usuario.access_hash), origen
+
+
+async def timbrar(client, peer, resultados):
+    """Llama al contacto y registra si el telefono de verdad recibio la
+    llamada (Telegram lo confirma con receive_date)."""
+    estado = {"id": None, "recibida": False, "contestada": False, "fin": None}
+    terminado = asyncio.Event()
+
+    async def al_actualizar(update):
+        if not isinstance(update, UpdatePhoneCall):
+            return
+        pc = update.phone_call
+        if estado["id"] is not None and getattr(pc, "id", None) != estado["id"]:
+            return
+        if isinstance(pc, PhoneCallWaiting) and pc.receive_date:
+            estado["recibida"] = True
+        elif isinstance(pc, PhoneCallAccepted):
+            estado["recibida"] = True
+            estado["contestada"] = True
+            terminado.set()
+        elif isinstance(pc, PhoneCallDiscarded):
+            estado["fin"] = type(pc.reason).__name__ if pc.reason else "sin_motivo"
+            terminado.set()
+
+    client.add_event_handler(al_actualizar, events.Raw)
+    try:
+        g_a = secrets.token_bytes(256)
+        res = await llamar_con_espera(client, RequestCallRequest(
+            user_id=peer,
+            random_id=random.randint(0, 0x7fffffff),
+            g_a_hash=hashlib.sha256(g_a).digest(),
+            protocol=PROTOCOLO_LLAMADA,
+            video=False,
+        ))
+        llamada = res.phone_call
+        estado["id"] = llamada.id
+        if isinstance(llamada, PhoneCallWaiting) and llamada.receive_date:
+            estado["recibida"] = True
+        resultados["llamada"] = "solicitada"
+        print("[Telethon] Llamada solicitada, esperando que timbre...")
+
+        try:
+            await asyncio.wait_for(terminado.wait(), timeout=SEGUNDOS_TIMBRE)
+        except asyncio.TimeoutError:
+            pass
+
+        if estado["fin"] is None:
+            try:
+                await client(DiscardCallRequest(
+                    peer=InputPhoneCall(id=llamada.id,
+                                        access_hash=llamada.access_hash),
+                    duration=0,
+                    reason=PhoneCallDiscardReasonDisconnect(),
+                    connection_id=0,
+                ))
+            except Exception as e:
+                print(f"[Telethon] No se pudo colgar: {e}")
+    finally:
+        client.remove_event_handler(al_actualizar, events.Raw)
+
+    if estado["contestada"]:
+        resultados["llamada"] = "contestada"
+    elif estado["fin"] == "PhoneCallDiscardReasonBusy":
+        resultados["llamada"] = "rechazada_por_el_contacto"
+    elif estado["recibida"]:
+        resultados["llamada"] = "timbro_en_el_telefono"
+    else:
+        resultados["llamada"] = "sin_confirmacion_de_timbre"
+    if estado["fin"]:
+        resultados["llamada_fin"] = estado["fin"]
+
+
+async def verificar_historial(client, peer, resultados):
+    """Busca en el chat la llamada perdida que deja Telegram: prueba de que la
+    llamada quedo registrada en el telefono del contacto."""
+    try:
+        for m in await client.get_messages(peer, limit=5):
+            accion = getattr(m, "action", None)
+            if isinstance(accion, MessageActionPhoneCall):
+                motivo = type(accion.reason).__name__ if accion.reason else "?"
+                resultados["registro_llamada_en_chat"] = motivo
+                return
+        resultados["registro_llamada_en_chat"] = "no_encontrado"
+    except Exception as e:
+        resultados["registro_llamada_en_chat"] = f"error: {e}"
+
+
+async def notificar_contactos(api_id, api_hash, session_string, contactos,
+                              mensaje_texto):
+    """Una sola conexion de Telegram para todos los contactos del despacho."""
+    logs = []
+    client = TelegramClient(StringSession(session_string), int(api_id),
+                            str(api_hash))
+    await client.connect()
+    try:
+        if not await client.is_user_authorized():
+            return [{"contact": c.get("phone_number"),
+                     "result": {"error": "La sesion de Telegram del usuario ya "
+                                         "no es valida: hay que volver a "
+                                         "generarla."}} for c in contactos]
+        # Para recibir los eventos de la llamada (timbro, contesto, colgo).
+        try:
+            await client(GetStateRequest())
         except Exception:
             pass
 
-    except Exception as err:
-        print(f"[Telethon Error Contacto {numero_destino}]: {err}")
-        resultados['error'] = str(err)
+        resolutor = Resolutor(client)
+        for c in contactos:
+            numero = c.get("phone_number")
+            resultados = {}
+            try:
+                peer, origen = await resolutor.resolver(c)
+                resultados["contacto_encontrado_por"] = origen
+                try:
+                    if mensaje_texto:
+                        msg = await client.send_message(peer, mensaje_texto)
+                except (errors.PeerIdInvalidError, errors.UserIdInvalidError,
+                        ValueError):
+                    # El id guardado ya no sirve (otra cuenta/sesion): se
+                    # busca de nuevo.
+                    borrar_cache_contacto(c)
+                    peer, origen = await resolutor.resolver(c, ignorar_cache=True)
+                    resultados["contacto_encontrado_por"] = origen
+                    msg = await client.send_message(peer, mensaje_texto)
+                resultados["mensaje"] = "enviado"
+                resultados["mensaje_id"] = msg.id
+                print(f"[Telethon] Mensaje entregado a {numero}")
+
+                try:
+                    await timbrar(client, peer, resultados)
+                except errors.UserPrivacyRestrictedError:
+                    resultados["llamada"] = ("bloqueada_por_privacidad: el "
+                                             "contacto no acepta llamadas de "
+                                             "esta cuenta")
+                except Exception as e:
+                    resultados["llamada"] = f"error: {e}"
+
+                await verificar_historial(client, peer, resultados)
+            except Exception as err:
+                print(f"[Telethon Error Contacto {numero}]: {err}")
+                resultados["error"] = str(err)
+            logs.append({"contact": numero, "result": resultados})
     finally:
         await client.disconnect()
-
-    return resultados
+    return logs
 
 
 async def despachar_alerta_para_usuario(timer, reason="timer_expired"):
@@ -398,6 +608,7 @@ async def despachar_alerta_para_usuario(timer, reason="timer_expired"):
         f"emergency_contacts?user_id=eq.{user_id}&select=*"
         "&order=priority_order.asc&limit=5"
     ) or []
+    contacts = [c for c in contacts if c.get("phone_number")]
 
     lat = timer.get("last_latitude")
     lon = timer.get("last_longitude")
@@ -411,21 +622,29 @@ async def despachar_alerta_para_usuario(timer, reason="timer_expired"):
     sos_msg = construir_mensaje(first_name, phone, lat, lon, puntos, reason,
                                 enlace, inicio_guardia=desde)
 
-    logs = []
-    for c in contacts:
-        dest_num = c.get("phone_number")
-        if dest_num and api_id and api_hash and session:
-            res = await ejecutar_llamada_y_mensaje(
-                api_id, api_hash, session, dest_num, sos_msg)
-            logs.append({"contact": dest_num, "result": res})
+    if not (api_id and api_hash and session):
+        logs = [{"contact": c.get("phone_number"),
+                 "result": {"error": "El perfil no tiene configurada la cuenta "
+                                     "de Telegram (api_id, api_hash o sesion)."}}
+                for c in contacts]
+    else:
+        try:
+            logs = await notificar_contactos(api_id, api_hash, session,
+                                             contacts, sos_msg)
+        except Exception as e:
+            print(f"[Telethon Error general]: {e}")
+            logs = [{"contact": c.get("phone_number"),
+                     "result": {"error": str(e)}} for c in contacts]
 
+    enviados = sum(1 for l in logs if l["result"].get("mensaje") == "enviado")
     supabase_request("alert_logs", method="POST", payload={
         "user_id": user_id,
         "trigger_type": reason,
         "latitude": lat,
         "longitude": lon,
         "contacts_notified": logs,
-        "status": "dispatched"
+        "status": "dispatched" if enviados else "failed",
+        "details": f"{enviados}/{len(logs)} contactos con mensaje entregado",
     })
 
 
@@ -530,6 +749,7 @@ class RenderWebServer(http.server.BaseHTTPRequestHandler):
             self.responder_json(200, {
                 "status": "online",
                 "service": "Sentinel Telethon Bridge",
+                "version": VERSION,
                 "time": datetime.datetime.now(datetime.timezone.utc).isoformat()
             })
         elif clean_path in ["/dispatch-immediate", "/cron", "/check-timers"]:
