@@ -269,6 +269,7 @@ def construir_mensaje(first_name, phone, lat, lon, puntos, reason, enlace=None,
                       inicio_guardia=None):
     coaccion = (reason == "duress_pin_coaccion")
     prueba = (reason == "prueba")
+    boton = (reason == "boton_emergencia")
 
     # Si el disparo no trajo coordenadas, se usa el punto mas reciente del
     # rastro en vez de mandar "Ubicacion no disponible".
@@ -302,6 +303,16 @@ def construir_mensaje(first_name, phone, lat, lon, puntos, reason, enlace=None,
             "NO la llames ni le escribas: quien la retiene podria estar\n"
             "mirando su telefono y eso la pondria en mas peligro.\n"
             "Llama al 911 y entrega la ubicacion de abajo."
+        )
+    elif boton:
+        encabezado = (
+            "ALERTA DE EMERGENCIA - PULSO EL BOTON DE AUXILIO\n\n"
+            f"De: {first_name} ({phone})\n"
+            "Motivo: activo manualmente el boton de emergencia de Sentinel.\n"
+            f"{horas}\n\n"
+            "Puede estar en peligro y con alguien mirando su telefono: antes\n"
+            "de llamarla, revisa el enlace de seguimiento. Si no puedes\n"
+            "confirmar que esta bien, llama al 911 y entrega la ubicacion."
         )
     else:
         encabezado = (
